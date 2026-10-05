@@ -50,7 +50,7 @@ cinedata_genai/
 ### Windows
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+.venv\Scripts\Activate
 ```
 Se estiver usando CMD:
 ```cmd
