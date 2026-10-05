@@ -9,11 +9,6 @@ from agent import (
     execute_sql_with_fallback,
     execute_with_fallback,
 )
-from langchain_community.callbacks.streamlit import (
-    StreamlitCallbackHandler,
-)
-
-
 st.set_page_config(
     page_title="CineData Analytics - Agente IA",
     page_icon="🎬",
@@ -21,6 +16,33 @@ st.set_page_config(
 )
 
 
+st.markdown(
+    """
+    <style>
+    .sidebar-title {
+        font-size: 1.8rem;
+        font-weight: 700;
+        line-height: 1.2;
+        margin-bottom: 0.25rem;
+    }
+
+    [data-testid="stSidebar"] ::-webkit-scrollbar {
+        width: 0px;
+        height: 0px;
+    }
+
+    [data-testid="stSidebar"] {
+        scrollbar-width: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# RESULT PARSING
+# ============================================================
 # ============================================================
 # RESULT PARSING
 # ============================================================
@@ -195,6 +217,103 @@ def parse_sql_result(sql_result):
             )
 
     return None
+
+
+def extract_sql_from_agent_response(response):
+    """Extract the most recent SQL query executed by the full SQL agent."""
+
+    if not isinstance(response, dict):
+        return None
+
+    intermediate_steps = response.get("intermediate_steps", [])
+    candidates = []
+
+    def add_candidate(value):
+        if not isinstance(value, str):
+            return
+
+        candidate = value.strip()
+
+        if not candidate:
+            return
+
+        candidate = re.sub(r"^```(?:sql)?\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s*```$", "", candidate).strip()
+
+        if re.match(r"^(SELECT|WITH)\b", candidate, flags=re.IGNORECASE):
+            candidates.append(candidate)
+
+    for step in intermediate_steps:
+        action = step[0] if isinstance(step, (tuple, list)) and step else step
+
+        tool_input = getattr(action, "tool_input", None)
+
+        if isinstance(tool_input, dict):
+            for key in ("query", "sql", "statement"):
+                add_candidate(tool_input.get(key))
+
+        elif isinstance(tool_input, str):
+            add_candidate(tool_input)
+
+        log = getattr(action, "log", None)
+
+        if isinstance(log, str):
+            matches = re.findall(
+                r"(?:Action Input|SQL Query|query)\s*:\s*(SELECT\b.*?)(?=\n(?:Observation|Thought|Action|$))",
+                log,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+            for match in matches:
+                add_candidate(match)
+
+    return candidates[-1] if candidates else None
+
+
+def render_sql_query(sql_query):
+    """Render SQL only when the user enabled the SQL display option."""
+
+    if sql_query:
+        with st.expander("🧾 SQL gerado"):
+            st.code(sql_query, language="sql")
+
+
+def render_agent_steps(response):
+    """Render the completed agent steps from the returned response."""
+
+    if not isinstance(response, dict):
+        return
+
+    intermediate_steps = response.get("intermediate_steps", [])
+
+    if not intermediate_steps:
+        st.info("O agente não retornou etapas intermediárias.")
+        return
+
+    with st.expander("🧠 Etapas do agente", expanded=True):
+        for index, step in enumerate(intermediate_steps, start=1):
+            if not isinstance(step, (tuple, list)) or len(step) < 2:
+                continue
+
+            action, observation = step[0], step[1]
+            tool_name = getattr(action, "tool", None) or "Ação do agente"
+            tool_input = getattr(action, "tool_input", None)
+
+            st.markdown(f"**Etapa {index} — {tool_name}**")
+
+            if tool_input is not None:
+                st.caption("Entrada da ferramenta")
+                if isinstance(tool_input, (dict, list, tuple)):
+                    st.code(str(tool_input), language="text")
+                else:
+                    st.code(str(tool_input), language="text")
+
+            if observation is not None:
+                st.caption("Resultado da ferramenta")
+                st.code(str(observation), language="text")
+
+            if index < len(intermediate_steps):
+                st.divider()
 
 
 # ============================================================
@@ -609,7 +728,8 @@ def render_chart(
 
 with st.sidebar:
     st.markdown(
-        "## 🎬 CineData"
+        '<div class="sidebar-title">🎬 CineData</div>',
+        unsafe_allow_html=True,
     )
 
     st.caption(
@@ -628,6 +748,11 @@ with st.sidebar:
 
     show_agent_steps = st.toggle(
         "🧠 Mostrar etapas do agente",
+        value=False,
+    )
+
+    show_generated_sql = st.toggle(
+        "🧾 Mostrar SQL gerado",
         value=False,
     )
 
@@ -762,6 +887,9 @@ def render_message(message):
             )
         )
 
+    if show_generated_sql and message.get("sql_query"):
+        render_sql_query(message["sql_query"])
+
     if message.get("model_used"):
         st.caption(
             f"🤖 Modelo utilizado: {message['model_used']}"
@@ -807,20 +935,6 @@ if prompt := st.chat_input(
             if response_mode == (
                 "Resposta normal"
             ):
-                callbacks = None
-
-                if show_agent_steps:
-                    streamlit_callback = (
-                        StreamlitCallbackHandler(
-                            st.container(),
-                            expand_new_thoughts=True,
-                        )
-                    )
-
-                    callbacks = [
-                        streamlit_callback
-                    ]
-
                 with st.spinner(
                     "Analisando o banco de dados..."
                 ):
@@ -828,8 +942,7 @@ if prompt := st.chat_input(
                         response,
                         model_used,
                     ) = execute_with_fallback(
-                        prompt,
-                        callbacks=callbacks,
+                        prompt
                     )
 
                 answer = response.get(
@@ -837,9 +950,17 @@ if prompt := st.chat_input(
                     "",
                 )
 
+                sql_query = extract_sql_from_agent_response(response)
+
                 st.write(
                     answer
                 )
+
+                if show_agent_steps:
+                    render_agent_steps(response)
+
+                if show_generated_sql:
+                    render_sql_query(sql_query)
 
                 st.caption(
                     f"🤖 Modelo utilizado: "
@@ -851,6 +972,7 @@ if prompt := st.chat_input(
                         "role": "assistant",
                         "type": "text",
                         "content": answer,
+                        "sql_query": sql_query,
                         "model_used": model_used,
                     }
                 )
@@ -884,6 +1006,9 @@ if prompt := st.chat_input(
                 sql_query = response.get(
                     "sql_query"
                 )
+
+                if show_generated_sql:
+                    render_sql_query(sql_query)
 
                 sql_result = response.get(
                     "sql_result"
@@ -993,6 +1118,7 @@ if prompt := st.chat_input(
                                 orient="records"
                             ),
                             "columns": dataframe.columns.tolist(),
+                            "sql_query": sql_query,
                             "model_used": model_used,
                         }
                     )
